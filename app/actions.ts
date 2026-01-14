@@ -1,8 +1,12 @@
 // app/actions.ts
-'use server'; // <--- ⚠️ 这一行非常重要！标记这是一个服务端运行的文件
+"use server"; // <--- ⚠️ 这一行非常重要！标记这是一个服务端运行的文件
 // 👇 1. 引入 Groq
 import Groq from "groq-sdk";
-import { HttpsProxyAgent } from 'https-proxy-agent'; // <--- ⚠️ 必须补上这一行！
+import OpenAI from "openai";
+import { HttpsProxyAgent } from "https-proxy-agent"; // <--- ⚠️ 必须补上这一行！
+// 👇 1. 引入 Node.js 原生模块
+import { exec } from "child_process";
+import { promisify } from "util";
 
 // 定义我们想要的数据结构
 export interface CommitData {
@@ -11,28 +15,90 @@ export interface CommitData {
   date: string;
   hash: string;
 }
-      console.log('process.env.GITHUB_TOKEN',process.env.GITHUB_TOKEN);
+// 把 exec 变成 Promise 风格，方便用 await
+const execAsync = promisify(exec);
+
+// ... (之前的 fetchCommits 代码保留) ...
+
+// 👇 2. 新增：读取本地 Git 记录的函数
+export async function fetchLocalCommits(
+  folderPath: string
+): Promise<CommitData[]> {
+  try {
+    // 这里的命令解释：
+    // -C "路径" : 告诉 git 去哪个文件夹下执行
+    // log : 查看日志
+    // -n 20 : 最近 20 条
+    // --pretty=format : 格式化输出 (哈希|作者|时间|信息)
+    // --date=short : 日期格式 YYYY-MM-DD
+    const command = `git -C "${folderPath}" log -n 20 --pretty=format:"%h|%an|%ad|%s" --date=short`;
+
+    console.log("正在执行本地命令:", command);
+
+    const { stdout } = await execAsync(command);
+
+    // 解析输出的字符串
+    const lines = stdout.split("\n").filter((line) => line.trim() !== "");
+
+    const commits = lines.map((line) => {
+      const [hash, author, date, message] = line.split("|");
+      return {
+        hash,
+        author,
+        date,
+        message,
+      };
+    });
+
+    return commits;
+  } catch (error) {
+    console.error("读取本地 Git 失败:", error);
+    // 判断一下是不是路径不对
+    throw new Error(
+      `无法读取该路径下的 Git 记录。请确认：\n1. 路径是否正确？\n2. 该文件夹里有 .git 文件夹吗？\n错误信息: ${error}`
+    );
+  }
+}
+
+export async function getGitCurrentUser(folderPath: string): Promise<string> {
+  try {
+    // 执行 git config user.name
+    const { stdout } = await execAsync(
+      `git -C "${folderPath}" config user.name`
+    );
+    return stdout.trim();
+  } catch (error) {
+    console.warn("无法读取 git user.name，将返回空字符串:", error);
+    return ""; // 读不到就返回空，让前端自己填
+  }
+}
 
 export async function fetchCommits(repoUrl: string): Promise<CommitData[]> {
-//   await getGroqModels(); 
+  //   await getGroqModels();
   // 1. 简单的输入清洗，把 "https://github.com/facebook/react" 变成 "facebook/react"
-  const cleanRepo = repoUrl.replace('https://github.com/', '').trim();
-  
-  if (!cleanRepo.includes('/')) {
+  const cleanRepo = repoUrl.replace("https://github.com/", "").trim();
+
+  if (!cleanRepo.includes("/")) {
     throw new Error('仓库格式错误，请输入 "owner/repo" 例如 "facebook/react"');
   }
-  console.log('api is:----------->',`https://api.github.com/repos/${cleanRepo}/commits?per_page=10`);
-  
+  console.log(
+    "api is:----------->",
+    `https://api.github.com/repos/${cleanRepo}/commits?per_page=10`
+  );
+
   // 2. 调用 GitHub API
-  const response = await fetch(`https://api.github.com/repos/${cleanRepo}/commits?per_page=10`, {
+  const response = await fetch(
+    `https://api.github.com/repos/${cleanRepo}/commits?per_page=10`,
+    {
       headers: {
-          'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`, // 从 .env.local 读取
-          'Accept': 'application/vnd.github.v3+json',
-        },
-        next: { revalidate: 60 } // 缓存 60 秒，避免频繁请求
-    });
-    
-    if (!response.ok) {
+        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, // 从 .env.local 读取
+        Accept: "application/vnd.github.v3+json",
+      },
+      next: { revalidate: 60 }, // 缓存 60 秒，避免频繁请求
+    }
+  );
+
+  if (!response.ok) {
     throw new Error(`GitHub API 请求失败: ${response.statusText}`);
   }
 
@@ -44,55 +110,95 @@ export async function fetchCommits(repoUrl: string): Promise<CommitData[]> {
     hash: item.sha.substring(0, 7),
     message: item.commit.message,
     author: item.commit.author.name,
-    date: new Date(item.commit.author.date).toLocaleDateString('zh-CN'),
+    date: new Date(item.commit.author.date).toLocaleDateString("zh-CN"),
   }));
 }
 // 👇 2. 新增：生成日报的函数
-export async function generateWeeklyReport(commits: CommitData[]) {
-  // 实例化 Groq 客户端
-  const groq = new Groq({
-    apiKey: process.env.GROQ_API_KEY,
-  });
-
-  // 3. 构造 Prompt (提示词工程)
-  // 这里的技巧是：给 AI 设定角色，并把数据转成字符串喂给它
-  const commitsString = commits.map(c => `- ${c.date}: ${c.message} (by ${c.author})`).join('\n');
-
-  const prompt = `
+export async function generateWeeklyReport(
+  commits: CommitData[],
+  modelId: string
+) {
+  // 定义 Prompt (公用的)
+  const commitsString = commits
+    .map((c) => `- ${c.date}: ${c.message} (by ${c.author})`)
+    .join("\n");
+  const systemPrompt = "你是一个高效的日报生成助手。";
+  const userPrompt = `
     你是一个资深的技术项目经理。请根据以下 GitHub 提交记录，写一份专业的日报/周报。
-    
     提交记录：
     ${commitsString}
-
+    
     要求：
     1. 使用中文。
-    2. 分类总结（例如：✨ 新功能、🐛 修复、🔨 优化）。
+    2. 语言精炼，言简意赅。
     3. 语气专业、简洁。
-    4. 不要罗列所有细节，要提炼核心价值。
-    5. 使用 Markdown 格式输出。
+    4. 分几点列出具体内容。
+    5. 简洁的直接列出工作内容，不需要使用 Markdown，不要写多余的内容
+    6. 只用写具体工作内容，不用写目标或者目的
+    例如： 
+    1.新增/修改上游企业时将地址、省、市、区、县修改为必填项。在供应商为自然人时，新增身份证号字段，且为必填项
+    2.修复原车牌号和入场车牌号字段显示问题
+    3.参考孝感易达云平台编写新的“采购、销售云平台台账”
   `;
 
   try {
-    const chatCompletion = await groq.chat.completions.create({
-      messages: [
-        { role: "system", content: "你是一个高效的日报生成助手。" },
-        { role: "user", content: prompt },
-      ],
-      // 推荐使用 Llama3 70B 模型，速度快且逻辑好
-      model: "llama-3.3-70b-versatile",
-      temperature: 0.5, // 0.5 比较稳重，不会乱编
-    });
+    let content = "";
 
-    return chatCompletion.choices[0]?.message?.content || "生成失败，AI 没有返回内容。";
+    // 👇 3. 判断是哪个厂商的模型
+    // 如果模型 ID 是以 "qwen" 开头，就走阿里云
+    if (modelId.startsWith("qwen")) {
+      console.log(`🚀 正在调用阿里云 (Model: ${modelId})...`);
+
+      const openai = new OpenAI({
+        apiKey: process.env.ALIYUN_API_KEY,
+        baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1", // 阿里云的 OpenAI 兼容地址
+        // ⚠️ 阿里云在国内，通常不需要代理。如果你开了全局 VPN 导致连不上，可以在这里传 proxy
+      });
+
+      const completion = await openai.chat.completions.create({
+        model: modelId,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+      });
+
+      content = completion.choices[0]?.message?.content || "";
+    } else {
+      // 👇 否则走 Groq (默认)
+      console.log(`🚀 正在调用 Groq (Model: ${modelId})...`);
+
+      const proxyUrl = "http://127.0.0.1:7890"; // 你的代理
+      const groq = new Groq({
+        apiKey: process.env.GROQ_API_KEY,
+        httpAgent: new HttpsProxyAgent(proxyUrl), // Groq 必须走代理
+      });
+
+      const completion = await groq.chat.completions.create({
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        model: modelId,
+        temperature: 0.5,
+      });
+
+      content = completion.choices[0]?.message?.content || "";
+    }
+
+    if (!content) throw new Error("AI 返回内容为空");
+    return content;
   } catch (error) {
-    console.error(process.env.GROQ_API_KEY,"Groq API Error:", error);
-    throw new Error("AI 生成周报失败，请检查 API Key 或网络。");
+    console.error("AI API Error:", error);
+    // 错误处理优化：如果是 401 说明 Key 错了
+    throw new Error(
+      `生成失败: ${error instanceof Error ? error.message : "未知错误"}`
+    );
   }
 }
-
 export async function getGroqModels() {
-  const proxyUrl = 'http://127.0.0.1:7890'; // 别忘了你的代理！
-  
+  const proxyUrl = "http://127.0.0.1:7890"; // 别忘了你的代理！
+
   const groq = new Groq({
     apiKey: process.env.GROQ_API_KEY,
     httpAgent: new HttpsProxyAgent(proxyUrl),
