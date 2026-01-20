@@ -22,7 +22,10 @@ const execAsync = promisify(exec);
 
 // 👇 2. 新增：读取本地 Git 记录的函数
 export async function fetchLocalCommits(
-  folderPath: string
+  folderPath: string,
+  limit: number = 25,
+  startDate?: string,
+  endDate?: string
 ): Promise<CommitData[]> {
   try {
     // 这里的命令解释：
@@ -31,7 +34,20 @@ export async function fetchLocalCommits(
     // -n 20 : 最近 20 条
     // --pretty=format : 格式化输出 (哈希|作者|时间|信息)
     // --date=short : 日期格式 YYYY-MM-DD
-    const command = `git -C "${folderPath}" log -n 20 --pretty=format:"%h|%an|%ad|%s" --date=short`;
+    let command = `git -C "${folderPath}" log -n ${limit} --pretty=format:"%h|%an|%ad|%s" --date=short`;
+
+    if (startDate) {
+      command += ` --since="${startDate}"`;
+    }
+    if (endDate) {
+      // git log --until includes the date, but checks against commit time.
+      // If we want to include the end date fully, we might want to ensure it covers the whole day.
+      // But YYYY-MM-DD in git log usually treats it as 00:00:00 of that day?
+      // Actually git log --until="2023-01-01" means until 2023-01-01 00:00:00.
+      // So if we want to include 2023-01-01, we should probably use "2023-01-01 23:59:59" or "2023-01-02".
+      // Let's append 23:59:59 to be safe and inclusive for the end date.
+      command += ` --until="${endDate} 23:59:59"`;
+    }
 
     console.log("正在执行本地命令:", command);
 
@@ -73,7 +89,23 @@ export async function getGitCurrentUser(folderPath: string): Promise<string> {
   }
 }
 
-export async function fetchCommits(repoUrl: string): Promise<CommitData[]> {
+interface GitHubCommit {
+    sha: string;
+    commit: {
+        message: string;
+        author: {
+            name: string;
+            date: string;
+        }
+    }
+}
+
+export async function fetchCommits(
+  repoUrl: string,
+  limit: number = 25,
+  startDate?: string,
+  endDate?: string
+): Promise<CommitData[]> {
   //   await getGroqModels();
   // 1. 简单的输入清洗，把 "https://github.com/facebook/react" 变成 "facebook/react"
   const cleanRepo = repoUrl.replace("https://github.com/", "").trim();
@@ -81,22 +113,24 @@ export async function fetchCommits(repoUrl: string): Promise<CommitData[]> {
   if (!cleanRepo.includes("/")) {
     throw new Error('仓库格式错误，请输入 "owner/repo" 例如 "facebook/react"');
   }
-  console.log(
-    "api is:----------->",
-    `https://api.github.com/repos/${cleanRepo}/commits?per_page=10`
-  );
+
+  const params = new URLSearchParams();
+  params.append("per_page", limit.toString());
+  // Ensure we use local time start/end by appending time string
+  if (startDate) params.append("since", new Date(`${startDate}T00:00:00`).toISOString());
+  if (endDate) params.append("until", new Date(`${endDate}T23:59:59.999`).toISOString());
+
+  const url = `https://api.github.com/repos/${cleanRepo}/commits?${params.toString()}`;
+  console.log("api is:----------->", url);
 
   // 2. 调用 GitHub API
-  const response = await fetch(
-    `https://api.github.com/repos/${cleanRepo}/commits?per_page=10`,
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, // 从 .env.local 读取
-        Accept: "application/vnd.github.v3+json",
-      },
-      next: { revalidate: 60 }, // 缓存 60 秒，避免频繁请求
-    }
-  );
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, // 从 .env.local 读取
+      Accept: "application/vnd.github.v3+json",
+    },
+    next: { revalidate: 60 }, // 缓存 60 秒，避免频繁请求
+  });
 
   if (!response.ok) {
     throw new Error(`GitHub API 请求失败: ${response.statusText}`);
@@ -105,14 +139,14 @@ export async function fetchCommits(repoUrl: string): Promise<CommitData[]> {
   const data = await response.json();
 
   // 3. 这里的 data 是 GitHub 返回的原始巨大对象，我们只取我们需要的部分
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return data.map((item: any) => ({
+  return (data as GitHubCommit[]).map((item) => ({
     hash: item.sha.substring(0, 7),
     message: item.commit.message,
     author: item.commit.author.name,
     date: new Date(item.commit.author.date).toLocaleDateString("zh-CN"),
   }));
 }
+
 // 👇 2. 新增：生成日报的函数
 export async function generateWeeklyReport(
   commits: CommitData[],
