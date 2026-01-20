@@ -1,7 +1,7 @@
 // app/page.tsx
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 // 引入后端 Server Actions
 import {
   fetchCommits,
@@ -11,8 +11,17 @@ import {
   CommitData,
 } from "./actions";
 
+// --- 类型定义 ---
+type Mode = "github" | "local";
+type ReportType = "daily" | "yesterday" | "weekly";
+
+interface AIModel {
+  id: string;
+  name: string;
+}
+
 // 定义支持的 AI 模型列表 (阿里云 + Groq)
-const AI_MODELS = [
+const AI_MODELS: AIModel[] = [
   // --- 阿里云系列 (国内直连) ---
   { id: "qwen-flash", name: "🇨🇳 通义千问 Turbo (极速)" },
   { id: "qwen-long-latest", name: "🇨🇳 通义千问 Plus (均衡推荐)" },
@@ -24,18 +33,36 @@ const AI_MODELS = [
   { id: "llama-3.1-8b-instant", name: "🇺🇸 Llama 3.1 8B (极速)" },
 ];
 
+// --- 辅助函数 ---
+const getDateString = (daysOffset: number = 0): string => {
+  const date = new Date();
+  date.setDate(date.getDate() + daysOffset);
+  return date
+    .toLocaleDateString("zh-CN", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    })
+    .replace(/\//g, "-");
+};
+
 export default function Home() {
   // --- 状态管理 ---
 
   // 1. 基础设置
-  const [mode, setMode] = useState<"github" | "local">("local"); // 模式：本地/网络
-  const [inputValue, setInputValue] = useState("D:/code/supplychain-frontend"); // 仓库路径或名
+  const [mode, setMode] = useState<Mode>("local"); // 模式：本地/网络
+  const [inputValue, setInputValue] = useState<string>("D:/code/supplychain-frontend"); // 仓库路径或名
+
+  // 1.1 新增：时间范围与条数
+  const [startDate, setStartDate] = useState<string>(getDateString(-30));
+  const [endDate, setEndDate] = useState<string>(getDateString(0));
+  const [limit, setLimit] = useState<number>(25);
 
   // 2. 报告设置
-  const [reportType, setReportType] = useState<"daily" | "weekly">("daily"); // 日报/周报
-  const [currentUser, setCurrentUser] = useState(""); // 当前用户 (用于日报过滤)
-  const [filterMerge, setFilterMerge] = useState(true); // 是否过滤 Merge 记录
-  const [selectedModel, setSelectedModel] = useState(AI_MODELS[0].id); // 选中的 AI 模型
+  const [reportType, setReportType] = useState<ReportType>("daily"); // 日报/周报
+  const [currentUser, setCurrentUser] = useState<string>(""); // 当前用户 (用于日报过滤)
+  const [filterMerge, setFilterMerge] = useState<boolean>(true); // 是否过滤 Merge 记录
+  const [selectedModel, setSelectedModel] = useState<string>(AI_MODELS[0].id); // 选中的 AI 模型
 
   // 3. 数据与加载状态
   const [loading, setLoading] = useState(false); // 获取 Commit loading
@@ -44,16 +71,32 @@ export default function Home() {
   const [generating, setGenerating] = useState(false); // AI 生成 loading
 
   // 👇 2. 新增：页面初始化自动执行 (相当于 Vue mounted)
+  // 以及当参数变化时自动刷新
   useEffect(() => {
     // 只有当路径不为空时才自动读取
     if (inputValue) {
-      handleFetch();
+      // 简单的防抖，避免频繁请求
+      const timer = setTimeout(() => {
+        handleFetch();
+      }, 500);
+      return () => clearTimeout(timer);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // 空数组 [] 代表只在组件挂载时执行一次
+  }, [startDate, endDate, limit, mode]); // inputValue 变化暂不自动触发，以免打字时频繁请求，用户可以回车或切焦点(需额外处理)，这里先保留基本依赖
 
   // 获取提交记录
   const handleFetch = async () => {
+    // 验证日期
+    if (startDate > endDate) {
+      alert("⚠️ 开始日期不能晚于结束日期");
+      return;
+    }
+    // 验证条数
+    if (limit < 1 || limit > 500) {
+      alert("⚠️ 条数限制必须在 1-500 之间");
+      return;
+    }
+
     setLoading(true);
     setReport("");
     setCommits([]);
@@ -61,11 +104,11 @@ export default function Home() {
     try {
       let data;
       if (mode === "github") {
-        data = await fetchCommits(inputValue);
+        data = await fetchCommits(inputValue, limit, startDate, endDate);
         setCurrentUser(""); // GitHub 模式暂不自动推断用户
       } else {
         // 本地模式：获取记录 + 获取用户名
-        data = await fetchLocalCommits(inputValue);
+        data = await fetchLocalCommits(inputValue, limit, startDate, endDate);
         const user = await getGitCurrentUser(inputValue);
         setCurrentUser(user);
       }
@@ -78,36 +121,41 @@ export default function Home() {
   };
   // handleFetch();
 
-  // 核心：过滤并调用 AI 生成报告
-  const handleGenerateReport = async () => {
-    if (commits.length === 0) return;
-
-    // 1. 执行过滤逻辑
-    const targetCommits = commits.filter((c) => {
+  // 3.1 核心：计算当前应该显示的 Commits (用于渲染列表和生成报告)
+  // 使用 useMemo 避免每次渲染都重新计算
+  const filteredCommits = useMemo(() => {
+    return commits.filter((c) => {
       // 规则 A: 过滤 Merge 记录
       if (filterMerge && c.message.startsWith("Merge")) return false;
 
       // 规则 B: 日报模式 (只看今天 + 只看我)
       if (reportType === "daily") {
-        const today = new Date()
-          .toLocaleDateString("zh-CN", {
-            year: "numeric",
-            month: "2-digit",
-            day: "2-digit",
-          })
-          .replace(/\//g, "-");
+        const today = getDateString(0);
         const isToday = c.date === today;
         const isMe = c.author.toLowerCase().includes(currentUser.toLowerCase());
         return isToday && isMe;
+      } else if (reportType === "yesterday") {
+        const yesterday = getDateString(-1);
+        const isYesterday = c.date === yesterday;
+        const isMe = c.author.toLowerCase().includes(currentUser.toLowerCase());
+        return isYesterday && isMe;
       }
 
       // 规则 C: 周报模式 (默认全要)
       return true;
     });
+  }, [commits, filterMerge, reportType, currentUser]);
 
+  // 核心：过滤并调用 AI 生成报告
+  const handleGenerateReport = async () => {
+    if (commits.length === 0) return;
+
+    // 直接使用 memo 计算好的结果
+    const targetCommits = filteredCommits;
+    
     if (targetCommits.length === 0) {
       alert(
-        `⚠️ 过滤后没有符合条件的记录。\n请检查：\n1. 今天是否有提交？\n2. 用户名 "${currentUser}" 是否匹配？\n3. 是否全是 Merge 记录？`
+        `⚠️ 过滤后没有符合条件的记录。\n请检查：\n1. ${reportType === "daily" ? "今天" : reportType === "yesterday" ? "昨天" : "期间"}是否有提交？\n2. 用户名 "${currentUser}" 是否匹配？\n3. 是否全是 Merge 记录？`
       );
       return;
     }
@@ -184,6 +232,16 @@ export default function Home() {
                 只看今日
               </button>
               <button
+                onClick={() => setReportType("yesterday")}
+                className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${
+                  reportType === "yesterday"
+                    ? "bg-blue-600 text-white shadow"
+                    : "text-blue-600 hover:bg-blue-100"
+                }`}
+              >
+                只看昨日
+              </button>
+              <button
                 onClick={() => setReportType("weekly")}
                 className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${
                   reportType === "weekly"
@@ -194,6 +252,57 @@ export default function Home() {
                 全部记录
               </button>
             </div>
+          </div>
+        </div>
+
+        {/* 1.1 时间范围与条数选择 (新的一行) */}
+        <div className="flex flex-wrap gap-4 items-center bg-gray-50 p-3 rounded-xl border border-gray-100 text-sm">
+          {/* 日期范围 */}
+          <div className="flex items-center gap-2">
+            <span className="text-gray-600 font-medium">📅 时间:</span>
+            <input
+              type="date"
+              value={startDate}
+              max={endDate}
+              onChange={(e) => setStartDate(e.target.value)}
+              className="border border-gray-300 rounded px-2 py-1.5 text-sm outline-none focus:ring-2 focus:ring-blue-500 text-gray-700"
+            />
+            <span className="text-gray-400">-</span>
+            <input
+              type="date"
+              value={endDate}
+              min={startDate}
+              onChange={(e) => setEndDate(e.target.value)}
+              className="border border-gray-300 rounded px-2 py-1.5 text-sm outline-none focus:ring-2 focus:ring-blue-500 text-gray-700"
+            />
+          </div>
+
+          <div className="w-px h-6 bg-gray-300 mx-2 hidden sm:block"></div>
+
+          {/* 条数限制 */}
+          <div className="flex items-center gap-2">
+             <span className="text-gray-600 font-medium">🔢 条数:</span>
+             <div className="relative">
+                <input 
+                    type="number"
+                    min="1"
+                    max="500"
+                    value={limit}
+                    onChange={(e) => setLimit(Number(e.target.value))}
+                    className="w-20 border border-gray-300 rounded px-2 py-1.5 text-sm outline-none focus:ring-2 focus:ring-blue-500 text-center font-mono text-gray-700"
+                />
+             </div>
+             <div className="flex gap-1">
+                {[10, 25, 50, 100].map(n => (
+                    <button 
+                        key={n}
+                        onClick={() => setLimit(n)}
+                        className={`px-2 py-1 rounded text-xs border transition-all ${limit === n ? 'bg-gray-800 text-white border-gray-800 shadow-sm' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-100'}`}
+                    >
+                        {n}
+                    </button>
+                ))}
+             </div>
           </div>
         </div>
 
@@ -228,8 +337,8 @@ export default function Home() {
           </button>
         </div>
 
-        {/* 3. 日报专属：作者过滤器 (仅在有数据且是日报模式时显示) */}
-        {reportType === "daily" && commits.length > 0 && (
+        {/* 3. 日报专属：作者过滤器 (仅在有数据且是日报/昨日模式时显示) */}
+        {(reportType === "daily" || reportType === "yesterday") && commits.length > 0 && (
           <div className="bg-yellow-50 border border-yellow-200 p-3 rounded-xl flex items-center gap-3 animate-in fade-in slide-in-from-top-2">
             <span className="text-sm text-yellow-800 font-bold">
               🕵️‍♂️ 你的 Git 名字:
@@ -288,26 +397,12 @@ export default function Home() {
             {/* Commits 列表可视化 */}
             <div className="bg-gray-50 rounded-xl border border-gray-200 p-4 max-h-64 overflow-y-auto text-sm space-y-2 mb-8 custom-scrollbar">
               {commits.map((c) => {
-                const today = new Date()
-                  .toLocaleDateString("zh-CN", {
-                    year: "numeric",
-                    month: "2-digit",
-                    day: "2-digit",
-                  })
-                  .replace(/\//g, "-");
-
                 // 判断逻辑：是否是 Merge？
                 const isMerge = c.message.startsWith("Merge");
 
-                // 判断逻辑：是否符合日报条件？
-                const isDailyTarget =
-                  reportType === "daily"
-                    ? c.date === today &&
-                      c.author.toLowerCase().includes(currentUser.toLowerCase())
-                    : true;
-
-                // 最终状态：被选中 = 符合模式条件 且 不是被过滤的Merge
-                const isSelected = isDailyTarget && !(filterMerge && isMerge);
+                // 判断逻辑：是否被选中（在 filteredCommits 中）
+                // 这里的 includes 比较引用，因为 filteredCommits 是从 commits filter 出来的，引用相同
+                const isSelected = filteredCommits.includes(c);
 
                 return (
                   <div
