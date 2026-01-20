@@ -179,7 +179,7 @@ export default function Home() {
         Git {reportType === "daily" ? "📅 日报" : "📊 周报"}生成器
       </h1>
 
-      <div className="w-full max-w-3xl bg-white p-6 rounded-2xl shadow-xl space-y-6 transition-all">
+      <div className="w-full max-w-5xl bg-white p-6 rounded-2xl shadow-xl space-y-6 transition-all">
         {/* 1. 顶部控制栏 (第一行) */}
         <div className="flex flex-wrap gap-4 justify-between items-center bg-gray-50 p-2 rounded-xl border border-gray-100">
           {/* 左侧：模式切换 */}
