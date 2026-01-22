@@ -1,12 +1,29 @@
 {
   "name": "git-daily-reporter",
   "version": "0.1.0",
+  "description": "AI Git Daily Reporter",
+  "author": "Your Name",
   "private": true,
+  "main": "electron/main.js",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "next lint",
+    "electron-dev": "concurrently \"cross-env BROWSER=none npm run dev\" \"wait-on http://localhost:3000 && cross-env ELECTRON_START_URL=http://localhost:3000 electron .\"",
+    "electron-build": "next build && electron-builder"
+  },
+  "build": {
+    "appId": "com.yourname.gitreporter",
+    "files": [
+      "out/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "asar": true
   },
   "dependencies": {
     "groq-sdk": "^0.37.0",
@@ -17,13 +34,19 @@
     "react-dom": "19.2.3"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "^4",
+    "@tailwindcss/postcss": "^4.0.0",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "^40.0.0",
+    "electron-builder": "^26.4.0",
     "eslint": "^9",
     "eslint-config-next": "16.1.1",
-    "tailwindcss": "^4",
-    "typescript": "^5"
+    "postcss": "^8",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5",
+    "wait-on": "^9.0.3"
   }
 }
